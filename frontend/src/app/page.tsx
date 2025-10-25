@@ -192,7 +192,7 @@ export default function Home() {
                       : 'bg-slate-100 text-slate-900 rounded-bl-md'
                   }`}>
                     {/* Text Content */}
-                    {(message.displayMode === 'text' || message.displayMode === 'mixed') && (
+                    {message.text && (
                       <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
                     )}
                     
@@ -201,7 +201,7 @@ export default function Home() {
                       <div className="mt-4">
                         <ProductGrid 
                           products={message.productCards} 
-                          title={message.displayMode === 'products' ? undefined : 'Available Products'}
+                          title={message.displayMode === 'products' ? 'Products Found' : 'Available Products'}
                         />
                       </div>
                     )}
