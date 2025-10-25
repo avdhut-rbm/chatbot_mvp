@@ -84,6 +84,23 @@ app.add_middleware(
 )
 
 
+# ============================================================================
+# RESPONSE MODELS WITH PRODUCT CARD SUPPORT
+# ============================================================================
+
+class ProductCard(BaseModel):
+    """Structured product data for UI rendering"""
+    id: str
+    name: str
+    brand: str
+    price: float
+    rating: Optional[float] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
@@ -95,6 +112,8 @@ class ChatResponse(BaseModel):
     session_id: str
     timestamp: str
     sources: Optional[List[Dict[str, Any]]] = None
+    product_cards: Optional[List[ProductCard]] = None
+    display_mode: str = "text"  # "text", "products", "mixed"
 
 
 # ============================================================================
@@ -396,6 +415,52 @@ def save_conversation(session_id: str, user_message: str, assistant_response: st
 
 
 # ============================================================================
+# PRODUCT CARD FORMATTING
+# ============================================================================
+
+def format_product_cards(products: List[Dict[str, Any]]) -> List[ProductCard]:
+    """Convert OpenSearch products to structured UI cards"""
+    cards = []
+    for product in products:
+        try:
+            card = ProductCard(
+                id=str(product.get('product_id', product.get('id', hash(product.get('name', ''))))),
+                name=product.get('name', 'Unknown Product'),
+                brand=product.get('brand', 'Unknown'),
+                price=float(product.get('price', 0)),
+                rating=float(product.get('rating', 0)) if product.get('rating') else None,
+                image_url=product.get('image_url', product.get('image')),
+                description=product.get('description', '')[:200] if product.get('description') else None,
+                category=product.get('category'),
+                subcategory=product.get('subcategory')
+            )
+            cards.append(card)
+        except Exception as e:
+            logger.error(f"Error formatting product card: {e}")
+            continue
+    
+    return cards
+
+
+def detect_display_mode(user_query: str, product_count: int) -> str:
+    """Determine if response should show product cards"""
+    query_lower = user_query.lower()
+    
+    # Show product grid for listing queries
+    listing_keywords = ['show', 'list', 'all', 'display', 'see', 'browse', 'available', 'give me']
+    if any(kw in query_lower for kw in listing_keywords) and product_count > 0:
+        return "products"
+    
+    # Show mixed (text + cards) for comparison queries with multiple products
+    comparison_keywords = ['compare', 'difference', 'versus', 'vs', 'better', 'between']
+    if any(kw in query_lower for kw in comparison_keywords) and product_count > 1:
+        return "mixed"
+    
+    # Default text-only for questions
+    return "text"
+
+
+# ============================================================================
 # FILTER EXTRACTION WITH IMPROVED CONTEXT AWARENESS
 # ============================================================================
 
@@ -484,8 +549,8 @@ JSON:"""
 # IMPROVED RAG PROMPT - FORCES COMPLETE LISTING
 # ============================================================================
 
-def create_enhanced_rag_prompt(user_message: str, products: List[Dict[str, Any]], history_text: str) -> str:
-    """Create prompt that forces listing ALL products without skipping any"""
+def create_enhanced_rag_prompt(user_message: str, products: List[Dict[str, Any]], history_text: str, display_mode: str = "text") -> str:
+    """Create prompt based on display mode"""
     
     categories = get_categories()
     business_name = get_business_name()
@@ -500,6 +565,19 @@ Customer question: {user_message}
 
 Respond helpfully."""
 
+    # For products display mode, just return brief intro
+    if display_mode == "products":
+        return f"""Customer asked: "{user_message}"
+
+Found {len(products)} products. The UI will display product cards with images, prices, and details.
+
+Write a brief 1-2 sentence introduction like: "I found {len(products)} products matching your search. You can browse them below."
+
+Do NOT list the products - just provide a friendly introduction.
+
+Response:"""
+
+    # For text/mixed mode, provide full conversational response
     # Pre-format the COMPLETE product list
     product_lines = []
     for i, product in enumerate(products):
@@ -561,7 +639,7 @@ async def startup_event():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Enhanced chat endpoint with conversation memory and intelligent context filtering"""
+    """Enhanced chat endpoint with product card support"""
     logger.info(f"Received message: {request.message}")
     
     session_id = request.session_id or "default"
@@ -580,7 +658,9 @@ async def chat(request: ChatRequest):
             response=redirect_response,
             session_id=session_id,
             timestamp=datetime.now().isoformat() + "Z",
-            sources=None
+            sources=None,
+            product_cards=None,
+            display_mode="text"
         )
     
     try:
@@ -597,10 +677,20 @@ async def chat(request: ChatRequest):
         products = await opensearch_client.search_products(request.message)
         logger.info(f"Found {len(products)} relevant products")
         
-        # Step 4: Create enhanced RAG prompt with conversation history
-        rag_prompt = create_enhanced_rag_prompt(request.message, products, history_text)
+        # Step 4: Detect display mode
+        display_mode = detect_display_mode(request.message, len(products))
+        logger.info(f"Display mode: {display_mode}")
         
-        # Step 5: Generate response using Ollama with RAG context
+        # Step 5: Format product cards for UI if needed
+        product_cards = None
+        if display_mode in ["products", "mixed"] and products:
+            product_cards = format_product_cards(products)
+            logger.info(f"Formatted {len(product_cards)} product cards")
+        
+        # Step 6: Create prompt based on display mode
+        rag_prompt = create_enhanced_rag_prompt(request.message, products, history_text, display_mode)
+        
+        # Step 7: Generate response using Ollama
         logger.info("Generating response with Ollama...")
         async with httpx.AsyncClient() as client:
             ollama_response = await client.post(
@@ -612,7 +702,7 @@ async def chat(request: ChatRequest):
                     "options": {
                         "temperature": 0.2,
                         "top_p": 0.85,
-                        "num_predict": 2500,
+                        "num_predict": 100 if display_mode == "products" else 2500,
                         "stop": [],
                         "repeat_penalty": 1.1
                     }
@@ -623,7 +713,7 @@ async def chat(request: ChatRequest):
             result = ollama_response.json()
             response_text = result.get("response", "Sorry, I couldn't generate a response.")
         
-        # Step 6: Save conversation to memory
+        # Step 8: Save conversation to memory
         save_conversation(session_id, request.message, response_text)
         logger.info(f"Saved conversation to session: {session_id}")
             
@@ -631,18 +721,22 @@ async def chat(request: ChatRequest):
         logger.error(f"RAG API error: {e}")
         response_text = f"Sorry, I'm having trouble processing your request right now."
         products = []
+        product_cards = None
+        display_mode = "text"
     
     return ChatResponse(
         response=response_text,
         session_id=session_id,
         timestamp=datetime.now().isoformat() + "Z",
-        sources=products if products else None
+        sources=products if products else None,
+        product_cards=product_cards,
+        display_mode=display_mode
     )
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Enhanced WebSocket endpoint with conversation memory and intelligent context filtering"""
+    """Enhanced WebSocket endpoint with product card support"""
     await websocket.accept()
     logger.info("WebSocket connection established")
     
@@ -671,30 +765,36 @@ async def websocket_endpoint(websocket: WebSocket):
                     "response": redirect_response,
                     "session_id": session_id,
                     "timestamp": datetime.now().isoformat() + "Z",
-                    "sources": None
+                    "sources": None,
+                    "product_cards": None,
+                    "display_mode": "text"
                 }
                 
                 await websocket.send_text(json.dumps(response))
                 continue
             
             try:
-                # Step 1: Conversation history already retrieved above
+                # Steps 1-8: Same as /api/chat endpoint
                 logger.info(f"Retrieved conversation history for session: {session_id}")
                 
-                # Step 2: Extract filters with context
                 filters = await extract_filters_with_context(user_message, history_text)
                 if filters:
                     logger.info(f"Extracted filters: {filters}")
                 
-                # Step 3: Search for ALL relevant products (no limit)
                 logger.info("Searching for ALL relevant products...")
                 products = await opensearch_client.search_products(user_message)
                 logger.info(f"Found {len(products)} relevant products")
                 
-                # Step 4: Create enhanced RAG prompt with conversation history
-                rag_prompt = create_enhanced_rag_prompt(user_message, products, history_text)
+                display_mode = detect_display_mode(user_message, len(products))
+                logger.info(f"Display mode: {display_mode}")
                 
-                # Step 5: Generate response using Ollama with RAG context
+                product_cards = None
+                if display_mode in ["products", "mixed"] and products:
+                    product_cards = format_product_cards(products)
+                    logger.info(f"Formatted {len(product_cards)} product cards")
+                
+                rag_prompt = create_enhanced_rag_prompt(user_message, products, history_text, display_mode)
+                
                 logger.info("Generating response with Ollama...")
                 async with httpx.AsyncClient() as client:
                     ollama_response = await client.post(
@@ -706,7 +806,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "options": {
                                 "temperature": 0.2,
                                 "top_p": 0.85,
-                                "num_predict": 2500,
+                                "num_predict": 100 if display_mode == "products" else 2500,
                                 "stop": [],
                                 "repeat_penalty": 1.1
                             }
@@ -717,7 +817,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     result = ollama_response.json()
                     response_text = result.get("response", "Sorry, I couldn't generate a response.")
                     
-                # Step 6: Save conversation to memory
                 save_conversation(session_id, user_message, response_text)
                 logger.info(f"Saved conversation to session: {session_id}")
                     
@@ -725,12 +824,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.error(f"RAG API error: {e}")
                 response_text = f"Sorry, I'm having trouble processing your request right now."
                 products = []
+                product_cards = None
+                display_mode = "text"
             
             response = {
                 "response": response_text,
                 "session_id": session_id,
                 "timestamp": datetime.now().isoformat() + "Z",
-                "sources": products if products else None
+                "sources": products if products else None,
+                "product_cards": [card.dict() for card in product_cards] if product_cards else None,
+                "display_mode": display_mode
             }
             
             await websocket.send_text(json.dumps(response))
@@ -743,7 +846,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "RAG-powered backend with intelligent responses"}
+    return {"status": "healthy", "message": "RAG-powered backend with product cards"}
 
 
 @app.post("/api/config/refresh")

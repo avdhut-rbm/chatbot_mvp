@@ -1,12 +1,27 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import ProductGrid from '../components/ProductGrid';
+
+interface ProductCard {
+  id: string;
+  name: string;
+  brand: string;
+  price: number;
+  rating?: number;
+  image_url?: string;
+  description?: string;
+  category?: string;
+  subcategory?: string;
+}
 
 interface Message {
   id: string;
   text: string;
   isUser: boolean;
   timestamp: string;
+  productCards?: ProductCard[];
+  displayMode?: string;
 }
 
 export default function Home() {
@@ -70,6 +85,8 @@ export default function Home() {
         text: data.response,
         isUser: false,
         timestamp: data.timestamp,
+        productCards: data.product_cards || [],
+        displayMode: data.display_mode || 'text',
       };
 
       setMessages(prev => [...prev, botMessage]);
@@ -174,7 +191,21 @@ export default function Home() {
                       ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-br-md'
                       : 'bg-slate-100 text-slate-900 rounded-bl-md'
                   }`}>
-                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                    {/* Text Content */}
+                    {(message.displayMode === 'text' || message.displayMode === 'mixed') && (
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                    )}
+                    
+                    {/* Product Cards */}
+                    {message.productCards && message.productCards.length > 0 && (
+                      <div className="mt-4">
+                        <ProductGrid 
+                          products={message.productCards} 
+                          title={message.displayMode === 'products' ? undefined : 'Available Products'}
+                        />
+                      </div>
+                    )}
+                    
                     <p className={`text-xs mt-2 ${
                       message.isUser ? 'text-blue-100' : 'text-slate-500'
                     }`}>
