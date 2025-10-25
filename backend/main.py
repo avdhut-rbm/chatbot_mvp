@@ -34,9 +34,13 @@ DOMAIN_CONFIG = {
         'available', 'stock', 'order', 'delivery', 'shipping', 'return',
         'warranty', 'deal', 'discount', 'sale', 'help', 'question',
         
-        # Product variations and listing - ADDED
+        # Product variations and listing
         'model', 'models', 'list', 'all', 'more', 'other', 'variant', 'version',
         'type', 'kind', 'option', 'selection', 'range', 'series', 'tell', 'down',
+        
+        # Common brands
+        'lenovo', 'samsung', 'apple', 'dell', 'hp', 'sony', 'lg', 'microsoft',
+        'asus', 'acer', 'canon', 'nikon', 'intel', 'amd', 'nvidia',
         
         # Material and specifications
         'material', 'style', 'design', 'feature', 'specification', 'dimension', 'weight',
@@ -53,7 +57,7 @@ DOMAIN_CONFIG = {
         'clothing', 'shoe', 'dress', 'shirt', 'pants', 'jacket', 'accessory',
         
         # Customer service
-        'how', 'what', 'where', 'when', 'which', 'why', 'tell', 'explain'
+        'how', 'what', 'where', 'when', 'which', 'why', 'tell', 'explain', 'yes', 'no'
     ],
     "off_topic_keywords": [
         'code', 'python', 'javascript', 'programming', 'function', 'optimize',
@@ -65,7 +69,6 @@ DOMAIN_CONFIG = {
 
 # Dynamic configuration loaded from OpenSearch
 DYNAMIC_CONFIG = {}
-
 
 # Global conversation memory (in production, use Redis or database)
 conversation_sessions = {}
@@ -104,7 +107,7 @@ async def load_dynamic_config_from_opensearch():
     
     try:
         async with httpx.AsyncClient() as client:
-            # Get aggregations for categories, brands, colors, materials
+            # Get aggregations - WITHOUT .keyword suffix
             agg_query = {
                 "size": 0,
                 "aggs": {
@@ -197,19 +200,49 @@ def get_business_name() -> str:
 
 
 # ============================================================================
-# OPENSEARCH CLIENT
+# OPENSEARCH CLIENT - UNLIMITED RESULTS
 # ============================================================================
 
 class OpenSearchClient:
     def __init__(self, host: str = "localhost", port: int = 9200):
         self.base_url = f"http://{host}:{port}"
         
-    async def search_products(self, query: str, size: int = 10) -> List[Dict[str, Any]]:
-        """Search for products using keyword search"""
+    async def search_products(self, query: str, max_results: int = 10000) -> List[Dict[str, Any]]:
+        """Search for ALL products matching query (no size limit)"""
         try:
             async with httpx.AsyncClient() as client:
+                # First, get the total count
+                count_query = {
+                    "size": 0,
+                    "query": {
+                        "multi_match": {
+                            "query": query,
+                            "fields": ["name^3", "description^2", "category^2", "brand^1.5", "tags", "subcategory"],
+                            "type": "best_fields",
+                            "fuzziness": "AUTO"
+                        }
+                    },
+                    "track_total_hits": True
+                }
+                
+                count_response = await client.post(
+                    f"{self.base_url}/amazon_electronics/_search",
+                    json=count_query,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10.0
+                )
+                count_response.raise_for_status()
+                count_result = count_response.json()
+                total_hits = count_result.get("hits", {}).get("total", {}).get("value", 0)
+                
+                logger.info(f"Total matching products: {total_hits}")
+                
+                # Cap at max_results for safety
+                actual_size = min(total_hits, max_results)
+                
+                # Get ALL matching products
                 search_query = {
-                    "size": size,
+                    "size": actual_size,
                     "query": {
                         "multi_match": {
                             "query": query,
@@ -227,13 +260,14 @@ class OpenSearchClient:
                     f"{self.base_url}/amazon_electronics/_search",
                     json=search_query,
                     headers={"Content-Type": "application/json"},
-                    timeout=10.0
+                    timeout=15.0
                 )
                 response.raise_for_status()
                 
                 result = response.json()
                 hits = result.get("hits", {}).get("hits", [])
                 
+                logger.info(f"Returning {len(hits)} products")
                 return [hit["_source"] for hit in hits]
                 
         except Exception as e:
@@ -246,29 +280,76 @@ opensearch_client = OpenSearchClient()
 
 
 # ============================================================================
-# CONTEXT VALIDATION WITH DYNAMIC CONFIG
+# INTELLIGENT CONTEXT VALIDATION WITH LLM
 # ============================================================================
 
-def is_on_topic(query: str) -> bool:
-    """Check if query is related to the business domain (using dynamic config)"""
-    query_lower = query.lower()
+async def is_on_topic_llm(query: str, history_text: str = "") -> bool:
+    """Use LLM to intelligently determine if query is shopping-related"""
     
-    # Get allowed topics from dynamic or static config
-    allowed_topics = get_allowed_topics()
+    # Quick keyword check for obvious off-topic cases (optimization)
+    obvious_off_topic = ['code', 'python', 'javascript', 'programming', 'debug', 'server', 'database', 'deploy', 'git']
+    if any(word in query.lower() for word in obvious_off_topic):
+        return False
     
-    # Check if query contains allowed topics
-    has_allowed_topic = any(
-        keyword in query_lower 
-        for keyword in allowed_topics
-    )
+    # Quick keyword check for obvious on-topic (optimization)
+    obvious_on_topic = ['product', 'buy', 'price', 'show', 'laptop', 'phone', 'compare', 'recommend']
+    if any(word in query.lower() for word in obvious_on_topic):
+        return True
     
-    # Check if query contains off-topic keywords (always static)
-    has_off_topic = any(
-        keyword in query_lower 
-        for keyword in DOMAIN_CONFIG['off_topic_keywords']
-    )
+    # For ambiguous cases, ask LLM
+    prompt = f"""Determine if this customer message is related to shopping/products.
+
+Previous conversation context:
+{history_text}
+
+Customer message: {query}
+
+Shopping-related topics include:
+- Asking about products, features, prices, availability
+- Requesting product recommendations or comparisons
+- Follow-up questions about previously discussed products (like "yes please", "tell me more", "what about", "show me", "yes", "sure", "okay")
+- Questions about delivery, warranty, returns
+- General product inquiries
+- Affirmative responses to product-related questions
+
+NOT shopping-related:
+- Programming/coding questions
+- Technical implementation questions
+- Unrelated general knowledge
+
+Consider the conversation context. If the customer previously asked about products and now says "yes please", "tell me more", "yes", or similar affirmative responses, that IS shopping-related.
+
+Answer with ONLY one word: YES or NO
+
+Answer:"""
     
-    return has_allowed_topic and not has_off_topic
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3.1:8b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 5
+                    }
+                },
+                timeout=10.0
+            )
+            response.raise_for_status()
+            result = response.json()
+            answer = result.get("response", "NO").strip().upper()
+            
+            is_shopping = "YES" in answer
+            logger.info(f"LLM topic classification for '{query}': {is_shopping}")
+            return is_shopping
+            
+    except Exception as e:
+        logger.error(f"LLM topic classification error: {e}")
+        # Fallback to permissive - allow the query
+        return True
 
 
 def get_redirect_response(query: str) -> str:
@@ -312,14 +393,6 @@ def save_conversation(session_id: str, user_message: str, assistant_response: st
     # Keep only last 12 messages
     if len(conversation_sessions[session_id]) > 12:
         conversation_sessions[session_id] = conversation_sessions[session_id][-12:]
-
-
-def truncate_response(text: str, max_sentences: int = 4) -> str:
-    """Truncate response to max sentences"""
-    sentences = text.split('. ')
-    if len(sentences) > max_sentences:
-        return '. '.join(sentences[:max_sentences]) + '.'
-    return text
 
 
 # ============================================================================
@@ -389,13 +462,13 @@ JSON:"""
                 os_filters.append({"range": {"price": price_range}})
             
             if "brand" in filters_dict:
-                os_filters.append({"term": {"brand.keyword": filters_dict["brand"]}})
+                os_filters.append({"term": {"brand": filters_dict["brand"]}})
             
             if "color" in filters_dict:
-                os_filters.append({"term": {"color.keyword": filters_dict["color"]}})
+                os_filters.append({"term": {"color": filters_dict["color"]}})
             
             if "category" in filters_dict:
-                os_filters.append({"term": {"category.keyword": filters_dict["category"]}})
+                os_filters.append({"term": {"category": filters_dict["category"]}})
             
             if "min_rating" in filters_dict:
                 os_filters.append({"range": {"rating": {"gte": filters_dict["min_rating"]}}})
@@ -408,63 +481,62 @@ JSON:"""
 
 
 # ============================================================================
-# DYNAMIC RAG PROMPT
+# IMPROVED RAG PROMPT - FORCES COMPLETE LISTING
 # ============================================================================
 
 def create_enhanced_rag_prompt(user_message: str, products: List[Dict[str, Any]], history_text: str) -> str:
-    """Create concise RAG prompt with dynamic business context"""
+    """Create prompt that forces listing ALL products without skipping any"""
     
-    # Use dynamic categories if available
     categories = get_categories()
-    categories_list = ", ".join(categories)
     business_name = get_business_name()
     
-    system_context = f"""You are a focused shopping assistant for {business_name}.
-
-Your responsibilities:
-- Help customers discover products in: {categories_list}
-- Compare products, prices, and features
-- Provide personalized recommendations
-- Answer questions about product specifications, availability, and policies
-
-Stay focused on shopping assistance. Politely redirect off-topic questions."""
-
     if not products:
-        return f"""{system_context}
+        return f"""You are a shopping assistant for {business_name}.
 
 Previous conversation:
 {history_text}
 
 Customer question: {user_message}
 
-Response (2-3 sentences, helpful and product-focused):"""
+Respond helpfully."""
 
-    # Format product information - show more products in listing mode
-    product_context = "\n\n".join([
-        f"""Product {i+1}: {product.get('name', 'N/A')}
-Brand: {product.get('brand', 'N/A')} | Price: ${product.get('price', 'N/A')} | Rating: {product.get('rating', 'N/A')}/5
-{product.get('description', 'N/A')[:80]}"""
-        for i, product in enumerate(products)
-    ])
+    # Pre-format the COMPLETE product list
+    product_lines = []
+    for i, product in enumerate(products):
+        line = f"{i+1}. **{product.get('name', 'Unknown')}** - {product.get('brand', 'Unknown')} - ${product.get('price', 'N/A')} - Rating: {product.get('rating', 'N/A')}/5"
+        product_lines.append(line)
+    
+    product_list = "\n".join(product_lines)
+    
+    # Count by brand for verification
+    brands = {}
+    for p in products:
+        brand = p.get('brand', 'Unknown')
+        brands[brand] = brands.get(brand, 0) + 1
+    
+    brand_counts = ", ".join([f"{count} {brand}" for brand, count in sorted(brands.items())])
 
-    return f"""{system_context}
+    return f"""You are a shopping assistant. A customer asked: "{user_message}"
 
-Previous conversation:
-{history_text}
+You found {len(products)} products ({brand_counts}).
 
-Customer question: {user_message}
+CRITICAL: You MUST output ALL {len(products)} products below. DO NOT skip, group, or summarize ANY products.
 
-Available products:
-{product_context}
+Copy this EXACT list:
 
-Instructions:
-- Answer in 2-4 sentences
-- If asked to list or show multiple products, mention at least 3-5 product names
-- Focus on products and shopping value
-- Mention names, prices, key features
-- Be conversational and helpful
+{product_list}
 
-Response:"""
+After showing ALL {len(products)} products above, add ONE short sentence asking what they're looking for.
+
+Rules:
+- Output the numbered list EXACTLY as shown above
+- Include every single product from 1 to {len(products)}
+- Do NOT reorganize, group by brand, or skip products
+- Do NOT add descriptions beyond what's in the list
+- After the complete list, ask ONE question
+
+Begin your response with "Here are all {len(products)} products:"
+"""
 
 
 # ============================================================================
@@ -489,13 +561,18 @@ async def startup_event():
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Enhanced chat endpoint with conversation memory and context filtering"""
+    """Enhanced chat endpoint with conversation memory and intelligent context filtering"""
     logger.info(f"Received message: {request.message}")
     
     session_id = request.session_id or "default"
     
-    # Guard against off-topic queries
-    if not is_on_topic(request.message):
+    # Get conversation history first for context
+    history_text = get_conversation_history(session_id)
+    
+    # Guard against off-topic queries with LLM-based classification
+    is_shopping_related = await is_on_topic_llm(request.message, history_text)
+    
+    if not is_shopping_related:
         redirect_response = get_redirect_response(request.message)
         logger.info(f"Off-topic query detected: {request.message}")
         save_conversation(session_id, request.message, redirect_response)
@@ -507,8 +584,7 @@ async def chat(request: ChatRequest):
         )
     
     try:
-        # Step 1: Get conversation history
-        history_text = get_conversation_history(session_id)
+        # Step 1: Conversation history already retrieved above
         logger.info(f"Retrieved conversation history for session: {session_id}")
         
         # Step 2: Extract filters with context
@@ -516,9 +592,9 @@ async def chat(request: ChatRequest):
         if filters:
             logger.info(f"Extracted filters: {filters}")
         
-        # Step 3: Search for relevant products using OpenSearch (increased to 10 results)
-        logger.info("Searching for relevant products...")
-        products = await opensearch_client.search_products(request.message, size=10)
+        # Step 3: Search for ALL relevant products (no limit)
+        logger.info("Searching for ALL relevant products...")
+        products = await opensearch_client.search_products(request.message)
         logger.info(f"Found {len(products)} relevant products")
         
         # Step 4: Create enhanced RAG prompt with conversation history
@@ -534,20 +610,18 @@ async def chat(request: ChatRequest):
                     "prompt": rag_prompt,
                     "stream": False,
                     "options": {
-                        "temperature": 0.7,
-                        "top_p": 0.9,
-                        "num_predict": 150,
-                        "stop": ["\n\n\n", "User:", "Question:", "Previous conversation:"]
+                        "temperature": 0.2,
+                        "top_p": 0.85,
+                        "num_predict": 2500,
+                        "stop": [],
+                        "repeat_penalty": 1.1
                     }
                 },
-                timeout=30.0
+                timeout=90.0
             )
             ollama_response.raise_for_status()
             result = ollama_response.json()
             response_text = result.get("response", "Sorry, I couldn't generate a response.")
-            
-            # Enforce brevity
-            response_text = truncate_response(response_text, max_sentences=4)
         
         # Step 6: Save conversation to memory
         save_conversation(session_id, request.message, response_text)
@@ -568,7 +642,7 @@ async def chat(request: ChatRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Enhanced WebSocket endpoint with conversation memory and context filtering"""
+    """Enhanced WebSocket endpoint with conversation memory and intelligent context filtering"""
     await websocket.accept()
     logger.info("WebSocket connection established")
     
@@ -582,8 +656,13 @@ async def websocket_endpoint(websocket: WebSocket):
             user_message = message_data.get('message', '')
             session_id = message_data.get('session_id', 'default')
             
-            # Guard against off-topic queries
-            if not is_on_topic(user_message):
+            # Get conversation history for context
+            history_text = get_conversation_history(session_id)
+            
+            # Guard against off-topic queries with LLM-based classification
+            is_shopping_related = await is_on_topic_llm(user_message, history_text)
+            
+            if not is_shopping_related:
                 redirect_response = get_redirect_response(user_message)
                 logger.info(f"Off-topic query detected: {user_message}")
                 save_conversation(session_id, user_message, redirect_response)
@@ -599,8 +678,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             
             try:
-                # Step 1: Get conversation history
-                history_text = get_conversation_history(session_id)
+                # Step 1: Conversation history already retrieved above
                 logger.info(f"Retrieved conversation history for session: {session_id}")
                 
                 # Step 2: Extract filters with context
@@ -608,9 +686,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if filters:
                     logger.info(f"Extracted filters: {filters}")
                 
-                # Step 3: Search for relevant products using OpenSearch (increased to 10 results)
-                logger.info("Searching for relevant products...")
-                products = await opensearch_client.search_products(user_message, size=10)
+                # Step 3: Search for ALL relevant products (no limit)
+                logger.info("Searching for ALL relevant products...")
+                products = await opensearch_client.search_products(user_message)
                 logger.info(f"Found {len(products)} relevant products")
                 
                 # Step 4: Create enhanced RAG prompt with conversation history
@@ -626,20 +704,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             "prompt": rag_prompt,
                             "stream": False,
                             "options": {
-                                "temperature": 0.7,
-                                "top_p": 0.9,
-                                "num_predict": 150,
-                                "stop": ["\n\n\n", "User:", "Question:", "Previous conversation:"]
+                                "temperature": 0.2,
+                                "top_p": 0.85,
+                                "num_predict": 2500,
+                                "stop": [],
+                                "repeat_penalty": 1.1
                             }
                         },
-                        timeout=30.0
+                        timeout=90.0
                     )
                     ollama_response.raise_for_status()
                     result = ollama_response.json()
                     response_text = result.get("response", "Sorry, I couldn't generate a response.")
-                    
-                    # Enforce brevity
-                    response_text = truncate_response(response_text, max_sentences=4)
                     
                 # Step 6: Save conversation to memory
                 save_conversation(session_id, user_message, response_text)
@@ -667,7 +743,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "RAG-powered backend with dynamic config is running"}
+    return {"status": "healthy", "message": "RAG-powered backend with intelligent responses"}
 
 
 @app.post("/api/config/refresh")
@@ -720,10 +796,10 @@ async def get_conversation_history_endpoint(session_id: str):
 
 
 @app.get("/api/search")
-async def search_products(query: str, size: int = 10):
-    """Direct search endpoint for testing OpenSearch functionality"""
+async def search_products(query: str):
+    """Direct search endpoint for testing OpenSearch functionality - returns ALL results"""
     try:
-        products = await opensearch_client.search_products(query, size)
+        products = await opensearch_client.search_products(query)
         return {
             "query": query,
             "results": products,
