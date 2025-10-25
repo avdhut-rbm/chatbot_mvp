@@ -27,18 +27,39 @@ DOMAIN_CONFIG = {
     "business_name": "Your Store",
     "categories": ["electronics", "furniture", "home goods"],
     "allowed_topics": [
-        # Base shopping topics
+        # Product discovery
         'product', 'item', 'buy', 'purchase', 'price', 'show', 'find', 'search',
         'browse', 'catalog', 'inventory', 'recommend', 'suggest', 'compare',
         'review', 'rating', 'best', 'top', 'popular', 'brand', 'color', 'size',
         'available', 'stock', 'order', 'delivery', 'shipping', 'return',
-        'warranty', 'deal', 'discount', 'sale', 'help', 'question'
+        'warranty', 'deal', 'discount', 'sale', 'help', 'question',
+        
+        # Product variations and listing - ADDED
+        'model', 'models', 'list', 'all', 'more', 'other', 'variant', 'version',
+        'type', 'kind', 'option', 'selection', 'range', 'series', 'tell', 'down',
+        
+        # Material and specifications
+        'material', 'style', 'design', 'feature', 'specification', 'dimension', 'weight',
+        
+        # Furniture specific
+        'sofa', 'chair', 'table', 'bed', 'desk', 'cabinet', 'shelf', 'decor',
+        'fabric', 'leather', 'wood', 'metal', 'finish', 'upholstery',
+        
+        # Electronics specific
+        'phone', 'laptop', 'camera', 'tablet', 'headphone', 'watch', 'speaker',
+        'screen', 'battery', 'storage', 'processor', 'display',
+        
+        # Fashion specific
+        'clothing', 'shoe', 'dress', 'shirt', 'pants', 'jacket', 'accessory',
+        
+        # Customer service
+        'how', 'what', 'where', 'when', 'which', 'why', 'tell', 'explain'
     ],
     "off_topic_keywords": [
         'code', 'python', 'javascript', 'programming', 'function', 'optimize',
         'debug', 'algorithm', 'server', 'database', 'api', 'backend', 'frontend',
         'deploy', 'docker', 'kubernetes', 'git', 'repository', 'compile',
-        'syntax', 'variable', 'loop', 'array', 'class', 'object'
+        'syntax', 'variable', 'loop', 'array', 'class', 'object', 'method'
     ]
 }
 
@@ -88,19 +109,19 @@ async def load_dynamic_config_from_opensearch():
                 "size": 0,
                 "aggs": {
                     "categories": {
-                        "terms": {"field": "category.keyword", "size": 50}
+                        "terms": {"field": "category", "size": 50}
                     },
                     "subcategories": {
-                        "terms": {"field": "subcategory.keyword", "size": 100}
+                        "terms": {"field": "subcategory", "size": 100}
                     },
                     "brands": {
-                        "terms": {"field": "brand.keyword", "size": 100}
+                        "terms": {"field": "brand", "size": 100}
                     },
                     "colors": {
-                        "terms": {"field": "color.keyword", "size": 50}
+                        "terms": {"field": "color", "size": 50}
                     },
                     "materials": {
-                        "terms": {"field": "material.keyword", "size": 50}
+                        "terms": {"field": "material", "size": 50}
                     }
                 }
             }
@@ -183,7 +204,7 @@ class OpenSearchClient:
     def __init__(self, host: str = "localhost", port: int = 9200):
         self.base_url = f"http://{host}:{port}"
         
-    async def search_products(self, query: str, size: int = 5) -> List[Dict[str, Any]]:
+    async def search_products(self, query: str, size: int = 10) -> List[Dict[str, Any]]:
         """Search for products using keyword search"""
         try:
             async with httpx.AsyncClient() as client:
@@ -192,7 +213,7 @@ class OpenSearchClient:
                     "query": {
                         "multi_match": {
                             "query": query,
-                            "fields": ["name^3", "description^2", "category^2", "brand", "tags", "subcategory"],
+                            "fields": ["name^3", "description^2", "category^2", "brand^1.5", "tags", "subcategory"],
                             "type": "best_fields",
                             "fuzziness": "AUTO"
                         }
@@ -302,22 +323,30 @@ def truncate_response(text: str, max_sentences: int = 4) -> str:
 
 
 # ============================================================================
-# FILTER EXTRACTION
+# FILTER EXTRACTION WITH IMPROVED CONTEXT AWARENESS
 # ============================================================================
 
 async def extract_filters_with_context(query: str, history_text: str) -> Optional[List[Dict]]:
     """Extract filters using LLM with conversation context"""
-    prompt = f"""Extract filters from this query. Return ONLY a JSON object.
+    prompt = f"""Extract filters from this query using conversation history for context. Return ONLY a JSON object.
 
 Previous conversation: {history_text}
 Current query: {query}
 
-Extract these filters if mentioned:
+IMPORTANT: If the current query refers to products mentioned in previous conversation (like "all models", "list them", "show more", "other options"), 
+extract the brand/category from the conversation history.
+
+Extract these filters if mentioned or implied from context:
 - price_min, price_max (numbers)
-- brand (exact match)
+- brand (exact match - check conversation history if not explicit in current query)
 - color (exact match)
-- category (exact match)
+- category (exact match - check conversation history if not explicit in current query)
 - min_rating (number)
+
+Examples:
+- Previous: "show me lenovo laptops" + Current: "list all models" → {{"brand": "Lenovo", "category": "laptops"}}
+- Previous: "laptops under $500" + Current: "show more" → {{"price_max": 500, "category": "laptops"}}
+- Previous: "Samsung phones" + Current: "under $200" → {{"brand": "Samsung", "category": "phones", "price_max": 200}}
 
 Return format:
 {{"price_min": 100, "brand": "Samsung"}}
@@ -336,7 +365,7 @@ JSON:"""
                     "stream": False,
                     "options": {
                         "temperature": 0.3,
-                        "num_predict": 50
+                        "num_predict": 100
                     }
                 },
                 timeout=15.0
@@ -360,13 +389,13 @@ JSON:"""
                 os_filters.append({"range": {"price": price_range}})
             
             if "brand" in filters_dict:
-                os_filters.append({"term": {"brand": filters_dict["brand"]}})
+                os_filters.append({"term": {"brand.keyword": filters_dict["brand"]}})
             
             if "color" in filters_dict:
-                os_filters.append({"term": {"color": filters_dict["color"]}})
+                os_filters.append({"term": {"color.keyword": filters_dict["color"]}})
             
             if "category" in filters_dict:
-                os_filters.append({"term": {"category": filters_dict["category"]}})
+                os_filters.append({"term": {"category.keyword": filters_dict["category"]}})
             
             if "min_rating" in filters_dict:
                 os_filters.append({"range": {"rating": {"gte": filters_dict["min_rating"]}}})
@@ -410,12 +439,12 @@ Customer question: {user_message}
 
 Response (2-3 sentences, helpful and product-focused):"""
 
-    # Format product information
+    # Format product information - show more products in listing mode
     product_context = "\n\n".join([
         f"""Product {i+1}: {product.get('name', 'N/A')}
 Brand: {product.get('brand', 'N/A')} | Price: ${product.get('price', 'N/A')} | Rating: {product.get('rating', 'N/A')}/5
 {product.get('description', 'N/A')[:80]}"""
-        for i, product in enumerate(products[:3])
+        for i, product in enumerate(products)
     ])
 
     return f"""{system_context}
@@ -430,6 +459,7 @@ Available products:
 
 Instructions:
 - Answer in 2-4 sentences
+- If asked to list or show multiple products, mention at least 3-5 product names
 - Focus on products and shopping value
 - Mention names, prices, key features
 - Be conversational and helpful
@@ -486,9 +516,9 @@ async def chat(request: ChatRequest):
         if filters:
             logger.info(f"Extracted filters: {filters}")
         
-        # Step 3: Search for relevant products using OpenSearch
+        # Step 3: Search for relevant products using OpenSearch (increased to 10 results)
         logger.info("Searching for relevant products...")
-        products = await opensearch_client.search_products(request.message, size=3)
+        products = await opensearch_client.search_products(request.message, size=10)
         logger.info(f"Found {len(products)} relevant products")
         
         # Step 4: Create enhanced RAG prompt with conversation history
@@ -578,9 +608,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if filters:
                     logger.info(f"Extracted filters: {filters}")
                 
-                # Step 3: Search for relevant products using OpenSearch
+                # Step 3: Search for relevant products using OpenSearch (increased to 10 results)
                 logger.info("Searching for relevant products...")
-                products = await opensearch_client.search_products(user_message, size=3)
+                products = await opensearch_client.search_products(user_message, size=10)
                 logger.info(f"Found {len(products)} relevant products")
                 
                 # Step 4: Create enhanced RAG prompt with conversation history
@@ -690,7 +720,7 @@ async def get_conversation_history_endpoint(session_id: str):
 
 
 @app.get("/api/search")
-async def search_products(query: str, size: int = 5):
+async def search_products(query: str, size: int = 10):
     """Direct search endpoint for testing OpenSearch functionality"""
     try:
         products = await opensearch_client.search_products(query, size)
